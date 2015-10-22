@@ -35,7 +35,7 @@ The format of the JSON object container the cluster information in etcd is:
                     .
                     .
 
-            "<node-n-id" : {
+            "<node-n-id>" : {
                 "ip"   : "<node-n-ip>",
                 "port" : <node-n-port>
             }
