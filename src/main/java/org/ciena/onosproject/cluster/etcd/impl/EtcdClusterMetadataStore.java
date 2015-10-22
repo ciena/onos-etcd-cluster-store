@@ -12,6 +12,7 @@ import org.boon.core.Handler;
 import org.boon.etcd.ClientBuilder;
 import org.boon.etcd.Etcd;
 import org.boon.etcd.Response;
+import org.ciena.onosproject.cluster.etcd.impl.ClusterMetadataException.Type;
 import org.onlab.packet.IpAddress;
 import org.onosproject.cluster.ClusterMetadata;
 import org.onosproject.cluster.ClusterMetadataEvent;
@@ -37,7 +38,6 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
     private static final String NODE_IP_KEY = "ip";
     private static final String NODE_PORT_KEY = "port";
     private static final String CONTROLLER_PARTITIONS_KEY = "partitions";
-    private static final String PARTITION_NODES_KEY = "nodes";
     private static final String DEFAULT_CLUSTER_NAME = "default";
     private static final String DEFAULT_ETCD_CONNECTION = "http://127.0.0.1:4001";
 
@@ -59,6 +59,39 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
         this(null, DEFAULT_CLUSTER_NAME);
     }
 
+    /**
+     * Utility function that will retry a command until it succeeds to a set numbers of retries has happened.
+     *
+     * @param name
+     *            used for logging purposes
+     * @param repeat
+     *            the number of times to retry
+     * @param sleep
+     *            ms to sleep between retries
+     * @param action
+     *            the action {@link java.lang.Runnable} to (re)try
+     * @throws Exception
+     *             if the command still fails after all retries and exception is propagated
+     */
+    private void retry(String name, int repeat, long sleep, Runnable action) throws Exception {
+        for (; repeat > 0; repeat -= 1) {
+            try {
+                action.run();
+                return;
+            } catch (Exception e) {
+                if (repeat > 1) {
+                    log.info("action '{}' failed, attempting retry. there are {} retries left", name, repeat - 1);
+                } else {
+                    log.error("action '{}' failed after all retries", name);
+                    throw e;
+                }
+            }
+
+            // I hate sleeps, but it seems appropriate
+            Thread.sleep(sleep);
+        }
+    }
+
     public void activate() {
         // Create a connection to etcd
         log.info("creating a connection to etcd at '{}' to support an external cluster metadata store, using key '{}'",
@@ -66,9 +99,8 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
         etcd = ClientBuilder.builder().hosts(URI.create(connection)).createClient();
 
         /*
-         * Prime the pump by doing a query against etcd to get the latest. This
-         * way we can publish to ONOS the latest data as well as do a wait to
-         * get all changes since that key
+         * Prime the pump by doing a query against etcd to get the latest. This way we can publish to ONOS the latest
+         * data as well as do a wait to get all changes since that key
          */
         Response prime = etcd.getConsistent(key);
         long primeIdx = 0;
@@ -80,13 +112,14 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
             primeIdx = prime.node().getModifiedIndex() + 1;
         } else if (prime.responseCode() != 404 /* NotFound */) {
             /*
-             * If we get something other than NotFound (i.e. no one has set the
-             * key) then this is bad news and we need to throw an exception.
+             * If we get something other than NotFound (i.e. no one has set the key) then this is bad news and we need
+             * to throw an exception.
              */
             log.error(
                     "unexpected failure when attempting to retrieved cluster information from etcd, error code == '{}'",
                     prime.responseCode());
-            // TODO: Throw exception
+            // TODO: should be checked exception
+            throw new RuntimeException(new ClusterMetadataReadFailureException(Type.Cluster, ""));
 
         } else /* NotFound */ {
             log.info("key used for cluster meta data, '{}', not found", key);
@@ -140,8 +173,8 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
     }
 
     /**
-     * Converts the information returned from etcd for cluster information into
-     * the data structure used internally by ONOS.
+     * Converts the information returned from etcd for cluster information into the data structure used internally by
+     * ONOS.
      *
      * @see org.onosproject.cluster.ClusterMetadata
      *
@@ -155,9 +188,8 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
         }
 
         /*
-         * The data in etcd is a stringified JSON object. This means that we can
-         * use standard tools to convert if to a usable structure (map of maps)
-         * and encode the data into the required structures
+         * The data in etcd is a stringified JSON object. This means that we can use standard tools to convert if to a
+         * usable structure (map of maps) and encode the data into the required structures
          */
         JsonObject jobj = new JsonObject(response.node().getValue());
 
@@ -195,15 +227,14 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
                     response.node().getModifiedIndex());
         }
 
-        // TODO: throw exception
-        return null;
+        // TODO: should be checked exception
+        throw new RuntimeException(new ClusterMetadataReadFailureException(Type.Cluster, ""));
     }
 
     @Override
     public void setClusterMetadata(ClusterMetadata md) {
         // Convert to JsonObject for storage in etcd
         JsonObject result = new JsonObject();
-
         JsonObject nodes = new JsonObject();
         JsonObject jobj;
         for (ControllerNode node : md.getNodes()) {
@@ -225,14 +256,25 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
         }
         result.putObject(CONTROLLER_PARTITIONS_KEY, parts);
 
-        log.error("setting '{}' == '{}'", key, result.encodePrettily());
-        Response response = etcd.set(key, result.encode());
-        if (!response.successful()) {
-            log.error("unable to set value, received reponse code '{}'", response.responseCode());
-            // TODO: exception
-        } else {
-            log.info("successfully set");
+        try {
+            retry("update cluster metadata", 3, 200, new Runnable() {
+                @Override
+                public void run() {
+                    log.error("setting '{}' == '{}'", key, result.encodePrettily());
+                    Response response = etcd.set(key, result.encode());
+                    if (!response.successful()) {
+                        log.error("unable to set value, received reponse code '{}'", response.responseCode());
+                        throw new RuntimeException(new ClusterMetadataWriteFailureException(Type.Cluster, ""));
+                    } else {
+                        log.info("successfully set");
+                    }
+                }
+            });
+        } catch (Exception e) {
+            // TODO should be checked exception
+            throw new RuntimeException(new ClusterMetadataWriteFailureException(Type.Cluster, "", e));
         }
+
     }
 
     @Override
@@ -243,9 +285,9 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
         if (response.successful()) {
 
             JsonObject jobj = new JsonObject(response.node().getValue());
-            JsonObject part = jobj.getObject(CONTROLLER_PARTITIONS_KEY).getObject(partitionId, null);
+            JsonArray part = jobj.getObject(CONTROLLER_PARTITIONS_KEY).getArray(partitionId, null);
             if (part != null) {
-                for (Object jnode : part.getArray(PARTITION_NODES_KEY)) {
+                for (Object jnode : part) {
                     result.add(new NodeId((String) jnode));
                 }
             }
@@ -255,12 +297,107 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
 
     @Override
     public void setActiveReplica(String partitionId, NodeId nodeId) {
-        // TODO Auto-generated method stub
+        /*
+         * No real easy way to manage this as a "piecemeal" operation, so instead the code has to pull the whole
+         * structure and then update the structure with the updated information. We need to be careful about the change
+         * indexes so that we don't stomp on something unexpectedly so we will use optimistic locking (i.e., only write
+         * back if the current version is what we thought it was when we started the change).
+         */
+        try {
+            retry("set active replica", 3, 200, new Runnable() {
+                @Override
+                public void run() {
+                    Response response = etcd.getConsistent(key);
+                    if (response.successful()) {
+                        // If the specified node isn't in the named partition add it
+                        JsonObject current = new JsonObject(response.node().getValue());
+                        JsonArray members = current.getObject(CONTROLLER_PARTITIONS_KEY).getArray(partitionId, null);
+                        if (members == null) {
+                            // TODO: should be checked not runtime exception
+                            throw new RuntimeException(new PartitionNotFoundException(partitionId));
+                        }
 
+                        // Not terrible efficient, but walk the array looking for a match
+                        String target = nodeId.toString();
+                        for (Object id : members) {
+                            if (target.equals(id)) {
+                                // Already exists, we are done.
+                                return;
+                            }
+                        }
+
+                        // Does not exist, we need to add
+                        members.addString(target);
+
+                        // Push change back to etcd
+                        response = etcd.compareAndSwapByModifiedIndex(key, response.node().getModifiedIndex(),
+                                current.encode());
+                        if (response.successful()) {
+                            // We are done
+                            return;
+                        }
+                        throw new RuntimeException(new ClusterMetadataWriteFailureException(
+                                ClusterMetadataWriteFailureException.Type.Partition, partitionId));
+                    }
+                }
+            });
+        } catch (Exception e) {
+            // TODO: really shouldn't be a runtime exception
+            throw new RuntimeException(new ClusterMetadataWriteFailureException(
+                    ClusterMetadataWriteFailureException.Type.Partition, partitionId, e));
+        }
     }
 
     @Override
     public void unsetActiveReplica(String partitionId, NodeId nodeId) {
-        // TODO Auto-generated method stub
+        try {
+            retry("unset active replica", 3, 200, new Runnable() {
+                @Override
+                public void run() {
+                    Response response = etcd.getConsistent(key);
+                    if (response.successful()) {
+                        // If the specified node isn't in the named partition add it
+                        JsonObject current = new JsonObject(response.node().getValue());
+                        JsonArray members = current.getObject(CONTROLLER_PARTITIONS_KEY).getArray(partitionId, null);
+                        if (members == null) {
+                            // TODO: should be checked not runtime exception
+                            throw new RuntimeException(new PartitionNotFoundException(partitionId));
+                        }
+
+                        /*
+                         * Walk through the member list and build a new array of all existing members except the one to
+                         * be removed.
+                         */
+                        JsonArray replace = new JsonArray();
+                        String target = nodeId.toString();
+                        for (Object id : members) {
+                            if (!target.equals(id)) {
+                                replace.addString((String) id);
+                            }
+                        }
+
+                        if (replace.size() == members.size()) {
+                            // No change, no need to update
+                            return;
+                        }
+                        current.getObject(CONTROLLER_PARTITIONS_KEY).putArray(partitionId, replace);
+
+                        // Push change back to etcd
+                        response = etcd.compareAndSwapByModifiedIndex(key, response.node().getModifiedIndex(),
+                                current.encode());
+                        if (response.successful()) {
+                            // We are done
+                            return;
+                        }
+                        throw new RuntimeException(new ClusterMetadataWriteFailureException(
+                                ClusterMetadataWriteFailureException.Type.Partition, partitionId));
+                    }
+                }
+            });
+        } catch (Exception e) {
+            // TODO: really shouldn't be a runtime exception
+            throw new RuntimeException(new ClusterMetadataWriteFailureException(
+                    ClusterMetadataWriteFailureException.Type.Partition, partitionId, e));
+        }
     }
 }
