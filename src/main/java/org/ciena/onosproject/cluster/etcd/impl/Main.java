@@ -1,7 +1,6 @@
 package org.ciena.onosproject.cluster.etcd.impl;
 
 import org.onosproject.cluster.ClusterMetadata;
-import org.onosproject.cluster.NodeId;
 import org.onosproject.store.service.Versioned;
 
 public final class Main {
@@ -13,9 +12,7 @@ public final class Main {
         ds.activate();
 
         Versioned<ClusterMetadata> md = ds.getClusterMetadata();
-        ds.setClusterMetadata(md.value());
 
-        ds.setActiveReplica("p1", new NodeId("5.4.3.2"));
         try {
             Object o = new Object();
             synchronized (o) {
