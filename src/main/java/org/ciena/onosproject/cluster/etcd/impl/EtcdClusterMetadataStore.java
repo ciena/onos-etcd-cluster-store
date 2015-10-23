@@ -21,6 +21,7 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.boon.core.Handler;
@@ -47,7 +48,8 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
 
     private static final Logger log = LoggerFactory.getLogger(EtcdClusterMetadataStore.class);
 
-    private static final String CLUSTER_KEY = "onos/cluster/%s";
+    private static final String CLUSTER_CONFIG_KEY = "onos/cluster/%s/config";
+    private static final String CLUSTER_OPERATIONAL_KEY = "onos/cluster/%s/operational/%s";
 
     private static final String CONTROLLER_NODES_KEY = "nodes";
     private static final String NODE_IP_KEY = "ip";
@@ -60,12 +62,12 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
     private Etcd etcd = null;
     private AtomicBoolean active = new AtomicBoolean(false);
     private final String clusterName;
-    private final String key;
+    private final String configKey;
     private final String connection;
 
     public EtcdClusterMetadataStore(String connection, String clusterName) {
         this.clusterName = clusterName;
-        this.key = String.format(CLUSTER_KEY, clusterName);
+        this.configKey = String.format(CLUSTER_CONFIG_KEY, clusterName);
 
         this.connection = (connection == null ? DEFAULT_ETCD_CONNECTION : connection);
     }
@@ -107,17 +109,53 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
         }
     }
 
+    /**
+     * Utility function that will retry a command that returns a result, until it succeeds to a set numbers of retries
+     * has happened.
+     *
+     * @param name
+     *            used for logging purposes
+     * @param repeat
+     *            the number of times to retry
+     * @param sleep
+     *            ms to sleep between retries
+     * @param action
+     *            the action {@link java.lang.Callable} to (re)try
+     * @throws Exception
+     *             if the command still fails after all retries and exception is propagated
+     */
+    private <T> T retryWithResult(String name, int repeat, long sleep, Callable<T> action) throws Exception {
+        for (; repeat > 0; repeat -= 1) {
+            try {
+                return action.call();
+            } catch (Exception e) {
+                if (repeat > 1) {
+                    log.info("action '{}' failed, attempting retry. there are {} retries left", name, repeat - 1);
+                } else {
+                    log.error("action '{}' failed after all retries", name);
+                    throw e;
+                }
+            }
+
+            // I hate sleeps, but it seems appropriate
+            Thread.sleep(sleep);
+        }
+
+        throw new RuntimeException("CANNOT COMPLETE");
+    }
+
     public void activate() {
         // Create a connection to etcd
         log.info("creating a connection to etcd at '{}' to support an external cluster metadata store, using key '{}'",
-                connection, key);
+                connection, configKey);
         etcd = ClientBuilder.builder().hosts(URI.create(connection)).createClient();
 
         /*
          * Prime the pump by doing a query against etcd to get the latest. This way we can publish to ONOS the latest
          * data as well as do a wait to get all changes since that key
          */
-        Response prime = etcd.getConsistent(key);
+        log.error("Attempting to get " + configKey);
+        Response prime = etcd.getConsistent(configKey);
         long primeIdx = 0;
         if (prime.successful()) {
             if (delegate != null) {
@@ -134,14 +172,15 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
                     "unexpected failure when attempting to retrieved cluster information from etcd, error code == '{}'",
                     prime.responseCode());
             // TODO: should be checked exception
-            throw new RuntimeException(new ClusterMetadataReadFailureException(Type.Cluster, ""));
+            throw new RuntimeException(
+                    new ClusterMetadataReadFailureException(Type.Cluster, String.valueOf(prime.responseCode())));
 
         } else /* NotFound */ {
-            log.info("key used for cluster meta data, '{}', not found", key);
+            log.info("key used for cluster meta data, '{}', not found", configKey);
         }
 
         active.set(true);
-        log.debug("starting change watch for key '{}'", key);
+        log.debug("starting change watch for key '{}'", configKey);
         etcd.wait(new Handler<Response>() {
             @Override
             public void handle(Response event) {
@@ -153,16 +192,16 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
                                 responseToClusterMetadata(event), event.node().getModifiedIndex()));
                     }
                     if (active.get()) {
-                        etcd.wait(this, key, event.node().getModifiedIndex() + 1);
+                        etcd.wait(this, configKey, event.node().getModifiedIndex() + 1);
                     }
                 } else if (event.responseCode() == 404 /* NotFount */) {
-                    log.warn("key used for cluster information, '{}', not found", key);
+                    log.warn("key used for cluster information, '{}', not found", configKey);
                 } else {
                     log.error("unexpected failure when waiting for change on cluster information"
                             + " from etcd, error code == '{}'", event.responseCode());
                 }
             }
-        }, key, primeIdx);
+        }, configKey, primeIdx);
     }
 
     public void deactivate() {
@@ -235,15 +274,23 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
     @Override
     public Versioned<ClusterMetadata> getClusterMetadata() {
 
-        Response response = etcd.getConsistent(key);
+        try {
+            Response response = retryWithResult("get cluster meta data", 3, 200, new Callable<Response>() {
+                @Override
+                public Response call() {
+                    return etcd.getConsistent(configKey);
+                }
+            });
 
-        if (response.successful()) {
-            return new Versioned<ClusterMetadata>(responseToClusterMetadata(response),
-                    response.node().getModifiedIndex());
+            if (response.successful()) {
+                return new Versioned<ClusterMetadata>(responseToClusterMetadata(response),
+                        response.node().getModifiedIndex());
+            }
+            throw new RuntimeException(new ClusterMetadataReadFailureException(Type.Cluster, ""));
+        } catch (Exception e) {
+            // TODO: should be checked exception
+            throw new RuntimeException(new ClusterMetadataReadFailureException(Type.Cluster, "", e));
         }
-
-        // TODO: should be checked exception
-        throw new RuntimeException(new ClusterMetadataReadFailureException(Type.Cluster, ""));
     }
 
     @Override
@@ -275,8 +322,8 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
             retry("update cluster metadata", 3, 200, new Runnable() {
                 @Override
                 public void run() {
-                    log.error("setting '{}' == '{}'", key, result.encodePrettily());
-                    Response response = etcd.set(key, result.encode());
+                    log.error("setting '{}' == '{}'", configKey, result.encodePrettily());
+                    Response response = etcd.set(configKey, result.encode());
                     if (!response.successful()) {
                         log.error("unable to set value, received reponse code '{}'", response.responseCode());
                         throw new RuntimeException(new ClusterMetadataWriteFailureException(Type.Cluster, ""));
@@ -296,18 +343,30 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
     public Collection<NodeId> getActiveReplicas(String partitionId) {
         List<NodeId> result = new ArrayList<NodeId>();
 
-        Response response = etcd.getConsistent(key);
-        if (response.successful()) {
+        String operKey = String.format(CLUSTER_OPERATIONAL_KEY, clusterName, partitionId);
 
-            JsonObject jobj = new JsonObject(response.node().getValue());
-            JsonArray part = jobj.getObject(CONTROLLER_PARTITIONS_KEY).getArray(partitionId, null);
-            if (part != null) {
-                for (Object jnode : part) {
-                    result.add(new NodeId((String) jnode));
+        try {
+            Response response = retryWithResult(String.format("get active replica in partition '%s'", partitionId), 3,
+                    200, new Callable<Response>() {
+
+                @Override
+                public Response call() throws Exception {
+                    return etcd.getConsistent(operKey);
+                }
+            });
+            if (response.successful()) {
+
+                JsonArray part = new JsonArray(response.node().getValue());
+                if (part != null) {
+                    for (Object jnode : part) {
+                        result.add(new NodeId((String) jnode));
+                    }
                 }
             }
+            return result;
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
-        return result;
     }
 
     @Override
@@ -318,18 +377,19 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
          * indexes so that we don't stomp on something unexpectedly so we will use optimistic locking (i.e., only write
          * back if the current version is what we thought it was when we started the change).
          */
+        String operKey = String.format(CLUSTER_OPERATIONAL_KEY, clusterName, partitionId);
         try {
-            retry("set active replica", 3, 200, new Runnable() {
+            retry(String.format("set active replica '%s' in partition '%s'", nodeId.toString(), partitionId), 3, 200,
+                    new Runnable() {
                 @Override
                 public void run() {
-                    Response response = etcd.getConsistent(key);
-                    if (response.successful()) {
-                        // If the specified node isn't in the named partition add it
-                        JsonObject current = new JsonObject(response.node().getValue());
-                        JsonArray members = current.getObject(CONTROLLER_PARTITIONS_KEY).getArray(partitionId, null);
-                        if (members == null) {
-                            // TODO: should be checked not runtime exception
-                            throw new RuntimeException(new PartitionNotFoundException(partitionId));
+                    Response response = etcd.getConsistent(operKey);
+                    if (response.successful() || response.responseCode() == 404) {
+                        JsonArray members = null;
+                        if (response.responseCode() == 404) {
+                            members = new JsonArray();
+                        } else {
+                            members = new JsonArray(response.node().getValue());
                         }
 
                         // Not terrible efficient, but walk the array looking for a match
@@ -345,8 +405,8 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
                         members.addString(target);
 
                         // Push change back to etcd
-                        response = etcd.compareAndSwapByModifiedIndex(key, response.node().getModifiedIndex(),
-                                current.encode());
+                        response = etcd.compareAndSwapByModifiedIndex(operKey,
+                                response.node().getModifiedIndex(), members.encode());
                         if (response.successful()) {
                             // We are done
                             return;
@@ -365,23 +425,24 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
 
     @Override
     public void unsetActiveReplica(String partitionId, NodeId nodeId) {
+        String operKey = String.format(CLUSTER_OPERATIONAL_KEY, clusterName, partitionId);
         try {
-            retry("unset active replica", 3, 200, new Runnable() {
+            retry(String.format("set active replica '%s' in partition '%s'", nodeId.toString(), partitionId), 3, 200,
+                    new Runnable() {
                 @Override
                 public void run() {
-                    Response response = etcd.getConsistent(key);
-                    if (response.successful()) {
-                        // If the specified node isn't in the named partition add it
-                        JsonObject current = new JsonObject(response.node().getValue());
-                        JsonArray members = current.getObject(CONTROLLER_PARTITIONS_KEY).getArray(partitionId, null);
-                        if (members == null) {
-                            // TODO: should be checked not runtime exception
-                            throw new RuntimeException(new PartitionNotFoundException(partitionId));
+                    Response response = etcd.getConsistent(operKey);
+                    if (response.successful() || response.responseCode() == 404) {
+                        if (response.responseCode() == 404) {
+                            // done
+                            return;
                         }
+                        // If the specified node isn't in the named partition add it
+                        JsonArray members = new JsonArray(response.node().getValue());
 
                         /*
-                         * Walk through the member list and build a new array of all existing members except the one to
-                         * be removed.
+                         * Walk through the member list and build a new array of all existing members except the
+                         * one to be removed.
                          */
                         JsonArray replace = new JsonArray();
                         String target = nodeId.toString();
@@ -395,11 +456,10 @@ public class EtcdClusterMetadataStore implements ClusterMetadataStore {
                             // No change, no need to update
                             return;
                         }
-                        current.getObject(CONTROLLER_PARTITIONS_KEY).putArray(partitionId, replace);
 
                         // Push change back to etcd
-                        response = etcd.compareAndSwapByModifiedIndex(key, response.node().getModifiedIndex(),
-                                current.encode());
+                        response = etcd.compareAndSwapByModifiedIndex(operKey,
+                                response.node().getModifiedIndex(), replace.encode());
                         if (response.successful()) {
                             // We are done
                             return;
