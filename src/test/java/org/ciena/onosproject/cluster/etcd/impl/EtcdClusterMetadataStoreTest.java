@@ -18,9 +18,12 @@ import org.onosproject.cluster.DefaultControllerNode;
 import org.onosproject.cluster.NodeId;
 import org.onosproject.cluster.Partition;
 import org.onosproject.store.service.Versioned;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.vertx.java.core.json.JsonArray;
 
 public class EtcdClusterMetadataStoreTest {
+    private static final Logger log = LoggerFactory.getLogger(EtcdClusterMetadataStoreTest.class);
 
     private static final String CONNECTION = "http://127.0.0.1:4001";
     private static final String CLUSTER_NAME = "default";
@@ -77,6 +80,7 @@ public class EtcdClusterMetadataStoreTest {
                 try {
                     Thread.sleep(200);
                 } catch (InterruptedException e1) {
+                    log.warn("Retry sleep interrupted");
                 }
             }
         }
@@ -88,6 +92,7 @@ public class EtcdClusterMetadataStoreTest {
                 try {
                     Thread.sleep(200);
                 } catch (InterruptedException e1) {
+                    log.warn("Retry sleep interrupted");
                 }
             }
         }
@@ -109,6 +114,7 @@ public class EtcdClusterMetadataStoreTest {
                 try {
                     Thread.sleep(200);
                 } catch (InterruptedException e) {
+                    log.warn("Retry sleep interrupted");
                 }
             }
         }
